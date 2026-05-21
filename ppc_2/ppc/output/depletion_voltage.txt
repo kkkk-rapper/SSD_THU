@@ -1,9 +1,0 @@
-PPC 耗尽电压 (SolidStateDetectors, estimate_depletion_voltage 二分法)
-=======================================================
-项目      : ppc_2 (3D, scratch)
-探测器    : PPC HPGe Detector
-  contact id=1  potential=3500.0 V
-  contact id=2  potential=0.0 V
-refinement: [0.2, 0.1, 0.05, 0.01]
-
-V_dep = 125.34648f0 V
