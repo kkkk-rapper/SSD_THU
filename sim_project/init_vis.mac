@@ -1,0 +1,6 @@
+# Executed in interactive mode (./sim_project with no arguments).
+# Build the geometry, set up visualization, then fire some gammas so the
+# point source and the irradiation geometry are visible in the viewer.
+/run/initialize
+/control/execute vis.mac
+/run/beamOn 300

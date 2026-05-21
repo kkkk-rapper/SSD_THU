@@ -1,0 +1,31 @@
+# ============================================================
+# sim_project : HPGe spectroscopy production run
+# ------------------------------------------------------------
+# Usage:  ./sim_project run.mac
+# Output: hits.csv  (written to the current working directory)
+# ============================================================
+
+/run/initialize
+
+# --- Source: 122 keV gamma point source, cone toward crystal -
+# Point source on the detector axis, 30 mm outside the N+ face.
+# Emission is restricted to a cone aimed at the crystal, so every
+# primary gamma is sent toward the N+ face -- no wasted primaries.
+#
+# Cone half-angle = atan(R_crystal / source-to-N+ distance)
+#                 = atan(15 mm / 30 mm) = 26.57 deg
+# rot1/rot2 rotate the GPS angular frame so theta = 0 points to +z
+# (toward the crystal); maxtheta then sets the cone opening.
+/gps/particle gamma
+/gps/energy 122 keV
+/gps/pos/type Point
+/gps/position 0 0 -30 mm
+/gps/ang/type iso
+/gps/ang/rot1 1 0 0
+/gps/ang/rot2 0 -1 0
+/gps/ang/mintheta 0 deg
+/gps/ang/maxtheta 26.57 deg
+
+# --- Run ----------------------------------------------------
+/run/printProgress 20000
+/run/beamOn 200000

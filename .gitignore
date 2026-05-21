@@ -2,6 +2,10 @@
 /ppc/garfield_demo/signal_demo
 *.o
 
+# Geant4 sim_project: CMake 构建目录与生成的大数据文件
+/sim_project/build/
+/sim_project/output/hits.csv
+
 # Claude Code 本地设置 (机器相关)
 .claude/
 

@@ -1,0 +1,25 @@
+# ============================================================
+# Visualization macro (interactive mode only).
+# ============================================================
+/vis/open OGL 700x700-0+0
+/vis/viewer/set/autoRefresh false
+/vis/verbose errors
+
+/vis/drawVolume
+/vis/viewer/set/viewpointThetaPhi 75. 20.
+/vis/viewer/zoom 1.5
+
+# Draw trajectories, coloured by particle type.
+/vis/scene/add/trajectories smooth
+/vis/modeling/trajectories/create/drawByParticleID
+/vis/modeling/trajectories/drawByParticleID-0/set gamma green
+/vis/modeling/trajectories/drawByParticleID-0/set e- red
+/vis/modeling/trajectories/drawByParticleID-0/set e+ blue
+/vis/scene/endOfEventAction accumulate
+
+/vis/scene/add/axes 0 0 0 10 mm
+/vis/scene/add/scale 10 mm
+/vis/scene/add/eventID
+
+/vis/viewer/set/autoRefresh true
+/vis/verbose warnings
