@@ -1,0 +1,6 @@
+# PPC HPGe — 耗尽电压估算
+配置     : config_noscratch.yaml   (tag = noscratch)
+探测器   : PPC HPGe Detector (baseline, no scratch)
+工作偏压 : 1000.0 V
+完全耗尽 : true
+耗尽电压 : 124.0 V

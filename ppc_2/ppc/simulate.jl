@@ -1,122 +1,171 @@
 using SolidStateDetectors
 using Unitful
 using Printf
+using CUDA
 
 # ===================================================================
-# PPC 高纯锗探测器 — 电场 & 信号波形模拟
-# 用法: julia --project=<SSD根目录> simulate.jl
+# PPC 高纯锗探测器 — 电场 / 耗尽电压 / 信号模拟  (有/无划痕 A/B 对照)
+# ===================================================================
+# 用法:
+#   julia -t auto --project=<SSD根目录> ppc/simulate.jl [阶段] [配置...]
+#     阶段  : depletion → 只算 电场 + 耗尽电压
+#             full (默认) → 再算信号波形
+#     配置  : 省略 → 默认依次跑 config.yaml 与 config_noscratch.yaml
+#             也可显式给一个或多个 yaml
+#   例:
+#     julia -t auto --project=. ppc/simulate.jl depletion
+#     julia -t auto --project=. ppc/simulate.jl full config.yaml
+#
+# 性能要点:
+#   · 多个配置在「同一个 julia 进程」里依次跑 —— JIT 编译只付一次
+#   · 用 `-t auto` 多线程启动 —— SSD 的网格 setup 等可并行部分会用上多核
+#   · depletion 阶段只解「电势 + 偏压电极权重势」，跳过用不到的另一个
+#     电极权重势和电场 —— 比 simulate!(全解) 少 ~1/3 求解量
+#   · 结果按配置写入独立子目录 output/<tag>/
 # ===================================================================
 
-# 路径解析
-SCRIPT_DIR  = @__DIR__                          # ppc/
-ROOT_DIR    = dirname(SCRIPT_DIR)               # SSD 根目录
-CONFIG_PATH = joinpath(SCRIPT_DIR, "config.yaml")
-OUTPUT_DIR  = joinpath(SCRIPT_DIR, "output")
-mkpath(OUTPUT_DIR)
+# ---- 命令行参数 ----
+STAGE   = length(ARGS) >= 1 ? ARGS[1] : "full"
+CONFIGS = length(ARGS) >= 2 ? ARGS[2:end] : ["config.yaml", "config_noscratch.yaml"]
 
-# 激活根目录的 Julia 环境
-import Pkg; Pkg.activate(ROOT_DIR)
-
+SCRIPT_DIR = @__DIR__
+ROOT_DIR   = dirname(SCRIPT_DIR)
 T = Float32
 
-println("="^60)
-println("PPC HPGe 探测器模拟")
-println("  配置: ", relpath(CONFIG_PATH, ROOT_DIR))
-println("  输出: ", relpath(OUTPUT_DIR, ROOT_DIR))
-println("="^60)
+# 网格控制: r、z 最大网格间距。主要作用是给「轴对称基线」一个够细的网格
+# (基线 φ 方向只有 ~8 点、很便宜，可放心加细)。0.3mm 对 3D 划痕模型几乎无
+# 影响 —— 划痕几何本身播下的网格已比这更细。
+const MAX_TICK = 0.3u"mm"
 
-# ===================================================================
-# 1. 加载探测器配置
-# ===================================================================
-sim = Simulation{T}(CONFIG_PATH)
-det  = sim.detector
-println("\n[1/4] 探测器: ", det.name)
-println("  材料: ", det.semiconductor.material)
-println("  温度: ", det.semiconductor.temperature)
-println("  偏压: ", det.contacts[1].potential, " V (contact1), ",
-                         det.contacts[2].potential, " V (contact2)")
+# 求解设备 (一次性确定)
+const DEVICE = CUDA.functional() ? CuArray : Array
 
-# ===================================================================
-# 2. 计算电势 + 电场 + 权重势
-# ===================================================================
-println("\n[2/4] 求解电场 & 权重势 (SOR + 网格精化)...")
-simulate!(sim,
-    convergence_limit = 1e-6,
+# 公共求解参数 (收敛限 1e-5 ≈ 0.01V，远细于耗尽电压 0.1V 容差，足够且更快)
+const SOLVER_KW = (
+    convergence_limit = 1e-5,
     refinement_limits = [0.2, 0.1, 0.05],
-    verbose = true
+    max_tick_distance = MAX_TICK,
+    device_array_type = DEVICE,
+    verbose           = true,
 )
-depleted = is_depleted(sim.point_types)
-println("  完全耗尽? ", depleted)
-if !depleted
-    println("  ⚠ 探测器未完全耗尽，建议提高偏压或降低杂质浓度")
-end
 
 # ===================================================================
-# 3. 估算耗尽电压
+# 单个配置的完整流程
 # ===================================================================
-# 注意: estimate_depletion_voltage 内部 @assert is_depleted(...)，
-#       探测器未完全耗尽时会抛异常。这里先判断，未耗尽则跳过，
-#       否则脚本会在此中断、跑不到第 4 步的信号模拟。
-println("\n[3/4] 耗尽电压估算...")
-if depleted
-    deplV = estimate_depletion_voltage(sim, verbose = true)
-    println("  耗尽电压 ≈ ", round(typeof(1.0u"V"), deplV))
-else
-    println("  跳过: 探测器未完全耗尽，estimate_depletion_voltage 仅适用于完全耗尽情形。")
-    println("       请提高偏压使其完全耗尽后重跑 (或调用时传 check_for_depletion = false)。")
-end
+function run_config(config_file::AbstractString, stage::AbstractString)
+    depletion_only = (stage == "depletion")
+    config_path = isabspath(config_file) ? config_file : joinpath(SCRIPT_DIR, config_file)
+    tag = config_file == "config.yaml"           ? "scratch"   :
+          config_file == "config_noscratch.yaml" ? "noscratch" :
+          first(splitext(basename(config_file)))
+    output_dir = joinpath(SCRIPT_DIR, "output", tag)
+    mkpath(output_dir)
 
-# ===================================================================
-# 4. 多位置信号模拟
-# ===================================================================
-println("\n[4/4] 信号波形模拟")
+    println("\n", "█"^60)
+    println("█ 配置: ", config_file, "   (tag = ", tag, ")")
+    println("█"^60)
 
-# 相互作用位置 — 格式: (标签, r, z)，r/z 单位为 mm
-# (下面构造 CylindricalPoint 时用 *1e-3 转成 SSD 内部单位「米」)
-event_specs = [
-    ("center",         0.0,  5.0),
-    ("mid-radius",     7.0,  5.0),
-    ("near-edge",     12.0,  5.0),
-    ("near-top",       5.0,  9.0),
-    ("near-bottom",    5.0,  1.0),
-    ("corner",         3.0,  1.0),
-]
-
-# 每个事件的能量沉积 — Cs-137 光电峰 661.7 keV
-# (不指定能量时 SSD 默认按 1 eV 处理，信号幅度会变成 1eV/2.95eV≈0.339，无物理意义)
-EVENT_ENERGY = 661.7u"keV"
-
-# 粗略模拟 (快速)
-println("  粗略模拟 (Δt=1ns):")
-for (label, r_mm, z_mm) in event_specs
-    cyl_pt = CylindricalPoint{T}(r_mm * 1e-3, 0.0, z_mm * 1e-3)
-    evt = Event([CartesianPoint(cyl_pt)], [EVENT_ENERGY])
-    simulate!(evt, sim, Δt = 1e-9, max_nsteps = 10000)
-    peaks = join(["c$(ci)=$(round(maximum(abs.(ustrip.(wf.signal))), digits=4))"
-                  for (ci, wf) in enumerate(evt.waveforms)], ", ")
-    println("    $(rpad(label, 14))  $(peaks)")
-end
-
-# 高精度中心点波形
-println("\n  高精度中心点波形 (Δt=0.5ns):")
-cyl_pt = CylindricalPoint{T}(0.0, 0.0, 5e-3)
-evt = Event([CartesianPoint(cyl_pt)], [EVENT_ENERGY])
-simulate!(evt, sim, Δt = 5e-10, max_nsteps = 20000)
-
-for (ci, wf) in enumerate(evt.waveforms)
-    t_ns = ustrip.(wf.time .* 1e9)
-    sig  = ustrip.(wf.signal)
-    path = joinpath(OUTPUT_DIR, "waveform_contact$(ci).txt")
-    open(path, "w") do io
-        println(io, "# PPC HPGe Detector — Contact $ci")
-        println(io, "# t(ns)  signal")
-        for (t, s) in zip(t_ns, sig)
-            @printf(io, "%.4f  %.8f\n", t, s)
-        end
+    # --- 1. 加载 ---
+    sim = Simulation{T}(config_path)
+    det = sim.detector
+    println("[1] 探测器: ", det.name, "  /  ", det.semiconductor.material.name,
+            "  /  ", det.semiconductor.temperature)
+    for c in det.contacts
+        println("    电极 id$(c.id)  ", rpad(c.name, 12), c.potential, " V")
     end
-    println("    → $(relpath(path, ROOT_DIR)) ($(length(t_ns)) 步)")
+    bias_id = det.contacts[argmax([abs(c.potential) for c in det.contacts])].id   # 偏压电极
+
+    # --- 2. 求解场 ---
+    if depletion_only
+        # 耗尽电压只需要「电势 + 偏压电极权重势」—— 跳过另一电极权重势和电场
+        println("[2] 求解 电势 + 偏压电极(id$bias_id)权重势  (设备: ",
+                DEVICE === CuArray ? "GPU $(CUDA.name(CUDA.device()))" : "CPU", ")")
+        calculate_electric_potential!(sim; SOLVER_KW...)
+        calculate_weighting_potential!(sim, bias_id; SOLVER_KW...)
+    else
+        # 信号模拟需要 电场 + 所有电极权重势
+        println("[2] 求解 电势 + 全部权重势 + 电场  (设备: ",
+                DEVICE === CuArray ? "GPU $(CUDA.name(CUDA.device()))" : "CPU", ")")
+        simulate!(sim; SOLVER_KW...)
+    end
+    depleted = is_depleted(sim.point_types)
+    println("    完全耗尽? ", depleted)
+
+    # --- 3. 耗尽电压 ---
+    bias = maximum(c.potential for c in det.contacts)
+    deplV = depleted ? estimate_depletion_voltage(sim; contact_id = bias_id, verbose = true) : nothing
+    if depleted
+        println("[3] 耗尽电压 ≈ ", round(typeof(1.0u"V"), deplV))
+    else
+        println("[3] ⚠ 在 ", bias, " V 下未完全耗尽，无法估算耗尽电压")
+    end
+    open(joinpath(output_dir, "depletion_voltage.txt"), "w") do io
+        println(io, "# PPC HPGe — 耗尽电压估算")
+        println(io, "配置     : ", config_file, "   (tag = ", tag, ")")
+        println(io, "探测器   : ", det.name)
+        println(io, "工作偏压 : ", bias, " V")
+        println(io, "完全耗尽 : ", depleted)
+        println(io, "耗尽电压 : ", isnothing(deplV) ? "无法估算 (未完全耗尽)" :
+                string(round(typeof(1.0u"V"), deplV)))
+    end
+
+    depletion_only && return (tag = tag, depleted = depleted, deplV = deplV)
+
+    # --- 4. 信号波形 (full 阶段) ---
+    println("[4] 信号波形模拟")
+    event_specs = [
+        ("center", 0.0, 5.0), ("mid-radius", 7.0, 5.0), ("near-edge", 12.0, 5.0),
+        ("near-top", 5.0, 9.0), ("near-bottom", 5.0, 1.0), ("corner", 3.0, 1.0),
+    ]
+    EVENT_ENERGY = 661.7u"keV"                                  # Cs-137 光电峰
+    println("    粗略 (Δt=1ns):")
+    for (label, r_mm, z_mm) in event_specs
+        cp = CylindricalPoint{T}(r_mm * 1e-3, 0.0, z_mm * 1e-3)
+        ev = Event([CartesianPoint(cp)], [EVENT_ENERGY])
+        simulate!(ev, sim, Δt = 1e-9, max_nsteps = 10000)
+        peaks = join(["c$(ci)=$(round(maximum(abs.(ustrip.(wf.signal))), digits=4))"
+                      for (ci, wf) in enumerate(ev.waveforms)], ", ")
+        println("      ", rpad(label, 14), peaks)
+    end
+    println("    高精度中心点 (Δt=0.5ns):")
+    ev = Event([CartesianPoint(CylindricalPoint{T}(0.0, 0.0, 5e-3))], [EVENT_ENERGY])
+    simulate!(ev, sim, Δt = 5e-10, max_nsteps = 20000)
+    for (ci, wf) in enumerate(ev.waveforms)
+        path = joinpath(output_dir, "waveform_contact$(ci).txt")
+        open(path, "w") do io
+            println(io, "# PPC HPGe ($tag) — Contact $ci")
+            println(io, "# t(ns)  signal")
+            for (t, s) in zip(ustrip.(wf.time .* 1e9), ustrip.(wf.signal))
+                @printf(io, "%.4f  %.8f\n", t, s)
+            end
+        end
+        println("      → ", relpath(path, ROOT_DIR))
+    end
+    return (tag = tag, depleted = depleted, deplV = deplV)
 end
 
-println("\n" * "="^60)
-println("完成: $(relpath(OUTPUT_DIR, ROOT_DIR))/")
+# ===================================================================
+# 主流程 — 同一进程内依次跑所有配置 (JIT 编译只付一次)
+# ===================================================================
+println("="^60)
+println("PPC HPGe 模拟")
+println("  阶段  : ", STAGE)
+println("  配置  : ", join(CONFIGS, ",  "))
+println("  线程  : ", Threads.nthreads(), "    设备: ",
+        DEVICE === CuArray ? "GPU" : "CPU")
+println("="^60)
+
+results = NamedTuple[]
+for cfg in CONFIGS
+    push!(results, run_config(cfg, STAGE))
+    GC.gc()
+    CUDA.functional() && CUDA.reclaim()       # 释放 GPU 显存，给下个配置腾地方
+end
+
+println("\n", "="^60)
+println("汇总")
+for r in results
+    println("  ", rpad(r.tag, 12),
+            r.depleted ? "耗尽电压 ≈ $(round(typeof(1.0u"V"), r.deplV))" : "未完全耗尽")
+end
 println("="^60)

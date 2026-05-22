@@ -7,3 +7,6 @@
 
 # Julia 临时
 /.julia/
+
+# 大体积仿真产物 (波形二进制 ~190MB/个，超 GitHub 100MB 限制，可由 signal.jl 重算)
+*.bin
